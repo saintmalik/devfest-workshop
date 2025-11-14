@@ -12,6 +12,7 @@ const DB_PASSWORD: string = "MyP@ssw0rd123!";
 const JWT_SECRET: string = "super-secret-jwt-key-12345";
 const API_KEY: string = "sk-proj-abc123xyz789-OPENAI-KEY";
 const AWS_SECRET: string = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+const STRIPE_KEY: string = "sk_live_51HqB2cK7v8N9oP1Q2r3S4t5U6v7W8x9Y0z1A2b3C4d5";
 const PRIVATE_KEY: string = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA0Z3VS...[truncated]";
 
 // SECURITY ISSUE #2: SQL Injection vulnerability
