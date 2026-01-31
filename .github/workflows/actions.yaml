@@ -1,0 +1,315 @@
+name: "The New Norms Deployment"
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: "20"
+
+permissions:
+  id-token: write
+  security-events: write
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      foldercheck: ${{ steps.changed-files.outputs.any_changed }}
+      has_code_changes: ${{ steps.code-changes.outputs.any_changed }}
+      has_dependency_changes: ${{ steps.dep-changes.outputs.any_changed }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5
+        with:
+          fetch-depth: 0
+
+      - name: Check all changes
+        id: changed-files
+        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 #v47
+        with:
+          files: "**"
+          since_last_remote_commit: true
+
+      - name: Check code changes
+        id: code-changes
+        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 #v47
+        with:
+          files: |
+            **/*.ts
+            **/*.tsx
+            **/*.js
+            **/*.jsx
+          since_last_remote_commit: true
+
+      - name: Check dependency changes
+        id: dep-changes
+        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 #v47
+        with:
+          files: |
+            **/package.json
+            **/package-lock.json
+            **/yarn.lock
+          since_last_remote_commit: true
+
+  secret_scan:
+    runs-on: ubuntu-latest
+    needs: check-changes
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: ./.github/actions/secret-scans
+        with:
+          github_token_gitleaks: ${{ secrets.GITHUB_TOKEN }}
+          gitleaks_license: ${{ secrets.GITLEAKS_LICENSE }}
+          devsecops_slack_webhook: ${{ secrets.DEVSECOPS_SLACK_WEBHOOK }}
+          current_branch: ${{ github.head_ref || github.ref_name }}
+          commit_message: ${{ github.event.head_commit.message || github.event.pull_request.title }}
+
+  dev_sast:
+    runs-on: ubuntu-latest
+    needs: check-changes
+    if: needs.check-changes.outputs.has_code_changes == 'true'
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Get opengrep-rules commit SHAs
+        id: commits
+        shell: bash
+        run: |
+          # No token needed for public repos!
+          get_sha() {
+            curl -s "https://api.github.com/repos/opengrep/opengrep-rules/commits/$1" | jq -r '.sha'
+          }
+          echo "main_sha=$(get_sha main)" >> $GITHUB_OUTPUT
+
+      - name: Clone opengrep-rules repository
+        run: |
+          # Clone the public repository without authentication
+          git clone --depth 1 --branch main https://github.com/opengrep/opengrep-rules.git opengrep-rules
+
+          echo "Main branch SHA: ${{ steps.commits.outputs.main_sha }}"
+
+      - name: Run SAST scan
+        uses: ./.github/actions/sast
+        with:
+          repository-name: ${{ github.repository }}
+          sast-recommend-uri: ${{ secrets.SAST_RECOMMEND_URI }}
+          deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          slack_channel: ${{ secrets.SLACK_CHANNEL }}
+          slack_token: ${{ secrets.SLACK_TOKEN }}
+
+  dev_sca:
+    runs-on: ubuntu-latest
+    needs: check-changes
+    if: needs.check-changes.outputs.has_dependency_changes == 'true'
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Run SCA scan
+        uses: ./.github/actions/sca
+        with:
+          repository-name: ${{ github.repository }}
+          slack_channel: ${{ secrets.SLACK_CHANNEL }}
+          slack_token: ${{ secrets.SLACK_TOKEN }}
+
+  deploy-static-web:
+    needs: [check-changes, dev_sca, secret_scan, dev_sast]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        shell: bash
+        run: npm install
+
+      - name: Create environment file
+        shell: bash
+        run: |
+          cat > .env << EOF
+          VITE_API_BASE_URL=${{ inputs.api_base_url }}
+          VITE_GOOGLE_CLIENT_ID=${{ inputs.google_client_id }}
+          EOF
+          echo "Created .env file with:"
+          cat .env
+
+      - name: Build app
+        shell: bash
+        run: ${{ inputs.build_command }}
+
+      - name: check and optimize build size
+        id: size_check
+        shell: bash
+        run: |
+          echo "=== Build Size Analysis ==="
+          du -sh ${{ inputs.output_location }}/
+
+          # Delete .map files to reduce size
+          find ${{ inputs.output_location }} -name "*.map" -type f -delete
+
+          echo "=== Largest files (>100KB) ==="
+          find ${{ inputs.output_location }} -type f -size +100k -exec ls -lh {} \; | sort -k5 -hr | head -10
+
+          # --- TOTAL SIZE CHECK (250MB) ---
+          TOTAL_SIZE=$(du -sb ${{ inputs.output_location }}/ | cut -f1)
+          LIMIT=250000000
+          TOTAL_SIZE_MB=$(($TOTAL_SIZE / 1024 / 1024))
+
+          echo "Total size: $TOTAL_SIZE bytes (${TOTAL_SIZE_MB}MB)"
+          echo "Azure limit: $LIMIT bytes (250MB)"
+          echo "size_mb=${TOTAL_SIZE_MB}" >> $GITHUB_OUTPUT
+          echo "size_bytes=${TOTAL_SIZE}" >> $GITHUB_OUTPUT
+
+          if [ $TOTAL_SIZE -gt $LIMIT ]; then
+            echo "size_exceeded=true" >> $GITHUB_OUTPUT
+            echo "⚠️  Over limit by $(($TOTAL_SIZE - $LIMIT)) bytes"
+            exit 1
+          else
+            echo "size_exceeded=false" >> $GITHUB_OUTPUT
+            echo "✅ Under the 250MB limit!"
+          fi
+
+          # --- INDIVIDUAL FILE SIZE CHECK (10MB) ---
+          echo "=== Checking for files > 10MB ==="
+          large_files=$(find ${{ inputs.output_location }} -type f -size +10485760c)
+
+          if [[ -n "$large_files" ]]; then
+            echo "❌ Found files larger than 10MB:"
+            echo "$large_files"
+            echo "file_over_10mb=true" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "✅ No files over 10MB found."
+            echo "file_over_10mb=false" >> $GITHUB_OUTPUT
+          fi
+
+
+      - name: Install Azure Static Web Apps CLI
+        if: steps.size_check.outputs.size_exceeded == 'false'
+        shell: bash
+        run: npm install -g @azure/static-web-apps-cli
+
+      - name: Azure CLI login
+        if: steps.size_check.outputs.size_exceeded == 'false'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ inputs.azure_client_id }}
+          tenant-id: ${{ inputs.tenant_id }}
+          subscription-id: ${{ inputs.azure_subscription_id }}
+
+      - name: Deploy to Azure Static Web App
+        if: steps.size_check.outputs.size_exceeded == 'false'
+        shell: bash
+        run: |
+          swa deploy \
+            --app-name ${{ inputs.swa_name }} \
+            --resource-group ${{ inputs.resource_group }} \
+            --output-location ${{ inputs.output_location }} \
+            --env production
+
+  deploy-containered-app:
+    needs: [check-changes, dev_sca, secret_scan, dev_sast]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5
+        with:
+          fetch-depth: 0
+
+      - name: Set variables
+        id: vars
+        shell: bash
+        run: |
+          echo "sha_short=$(git rev-parse --short ${{ github.sha }})" >> $GITHUB_OUTPUT
+
+      - name: Azure CLI login
+        uses: azure/login@cb79c773a3cfa27f31f25eb3f677781210c9ce3d #v1
+        with:
+          client-id: ${{ inputs.azure_client_id }}
+          tenant-id: ${{ inputs.azure_tenant_id }}
+          subscription-id: ${{ inputs.azure_subscription_id }}
+
+      - name: Get previous cache tag
+        id: get-prev-tag
+        shell: bash
+        run: |
+          PREV_TAG=$(az acr repository show-tags --name ${{ inputs.registry }} --repository ${{ inputs.image_name }} \
+            --query "[?starts_with(@, 'cache-')] | sort_by(@, &@) | [-1]" \
+            --output tsv 2>/dev/null || echo "cache-initial")
+          echo "prev_cache_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+
+      - name: Login to ACR
+        shell: bash
+        run: az acr login --name ${{ inputs.registry }}
+
+      - name: Build image
+        uses: docker/build-push-action@4a13e500e55cf31b7a5d59a38ab2040ab0f42f56 # v5.4.0
+        with:
+          context: .
+          file: ${{ inputs.repository }}/Dockerfile
+          push: false
+          tags: ${{ inputs.registry }}.azurecr.io/${{ inputs.image_name }}:${{ steps.vars.outputs.sha_short }}
+          cache-from: type=registry,ref=${{ inputs.registry }}.azurecr.io/${{ inputs.image_name }}:${{ steps.get-prev-tag.outputs.prev_cache_tag }}
+          cache-to: type=registry,ref=${{ inputs.registry }}.azurecr.io/${{ inputs.image_name }}:cache-${{ steps.vars.outputs.sha_short }},mode=max
+          load: true
+
+      - name: Scan image
+        uses: anchore/scan-action@64a33b277ea7a1215a3c142735a1091341939ff5 # v6.0.0
+        with:
+          image: ${{ inputs.registry }}.azurecr.io/${{ inputs.image_name }}:${{ steps.vars.outputs.sha_short }}
+          fail-build: false
+          output-format: table
+          severity-cutoff: high
+
+      - name: Push image
+        shell: bash
+        run: docker push ${{ inputs.registry }}.azurecr.io/${{ inputs.image_name }}:${{ steps.vars.outputs.sha_short }}
+
+      - name: Get image digest
+        id: digest
+        shell: bash
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ inputs.registry }}.azurecr.io/${{ inputs.image_name }}:${{ steps.vars.outputs.sha_short }})
+          echo "target_artifact_reference=$DIGEST" >> $GITHUB_OUTPUT
+
+      - name: Setup Notation
+        uses: notaryproject/notation-action/setup@v1
+        with:
+          version: 1.0.0
+
+      - name: Sign Image
+        uses: notaryproject/notation-action/sign@v1
+        with:
+          plugin_name: azure-kv
+          plugin_url: https://github.com/Azure/notation-azure-kv/releases/download/v1.0.1/notation-azure-kv_1.0.1_linux_amd64.tar.gz
+          plugin_checksum: f8a75d9234db90069d9eb5660e5374820edf36d710bd063f4ef81e7063d3810b
+          key_id: ${{ inputs.azure_notation_key_id }}
+          target_artifact_reference: ${{ steps.digest.outputs.target_artifact_reference }}
+          signature_format: cose
+          plugin_config: |
+            self_signed=true
+
+      - name: Output image reference
+        id: output-reference
+        shell: bash
+        run: |
+          echo "image_reference=${{ inputs.registry }}.azurecr.io/${{ inputs.image_name }}:${{ steps.vars.outputs.sha_short }}" >> $GITHUB_OUTPUT

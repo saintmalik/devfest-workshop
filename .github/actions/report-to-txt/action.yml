@@ -1,0 +1,29 @@
+name: "Report Converter"
+description: "Convert Markdown reports to TXT for Slack"
+
+inputs:
+  report_md:
+    required: true
+    description: "Path to the input Markdown report file"
+  output_txt:
+    required: true
+    description: "Path for the output TXT file"
+
+outputs:
+  txt_file:
+    description: "The name of the generated TXT file"
+    value: ${{ steps.convert.outputs.txt_file }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Pandoc
+      run: sudo apt-get update && sudo apt-get install -y pandoc
+      shell: bash
+
+    - name: Convert MD → TXT
+      id: convert
+      run: |
+        pandoc "${{ inputs.report_md }}" -t plain -o "${{ inputs.output_txt }}"
+        echo "txt_file=${{ inputs.output_txt }}" >> $GITHUB_OUTPUT
+      shell: bash

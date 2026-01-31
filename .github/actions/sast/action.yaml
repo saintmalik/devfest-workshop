@@ -1,0 +1,125 @@
+name: "SAST"
+description: "Run sast scan and generate reports"
+
+inputs:
+  opengrep_version:
+    description: "The version of OpenGrep to use"
+    required: true
+    default: "v1.11.0"
+  repository-name:
+    description: 'The name of the repository to use for the report filename.'
+    required: true
+  sast-recommendation-uri:
+    description: 'D1 API key for AI report generation.'
+    required: true
+  deepseek_api_key:
+    description: 'DeepSeek API key for AI report generation.'
+    required: true
+  slack_token:
+    description: 'Slack bot token'
+    required: true
+  slack_channel:
+    description: 'Slack channel ID'
+    required: true
+
+outputs:
+  has_findings:
+    description: "Indicates if the scan found any issues"
+    value: ${{ steps.report.outputs.has_findings }}
+  report_json_file:
+    description: 'The name of the generated JSON report file.'
+    value: ${{ steps.report.outputs.report_json_file }}
+  report_md_file:
+    description: 'The name of the generated Markdown report file.'
+    value: ${{ steps.report.outputs.report_md_file }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install OpenGrep
+      shell: bash
+      run: |
+        VERSION=${{ inputs.opengrep_version }}
+        curl -sSfL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash -s -- -v "$VERSION"
+        echo "${HOME}/.opengrep/cli/latest" >> $GITHUB_PATH
+
+    - name: Run OpenGrep
+      run: |
+        opengrep scan \
+          -f opengrep-rules/ \
+          --no-git-ignore \
+          --no-rewrite-rule-ids \
+          --include='**/*.tsx' \
+          --include='**/*.js' \
+          --include='**/*.ts' \
+          --exclude-rule=jsx-not-internationalized \
+          --no-force-color \
+          --severity=ERROR \
+          --severity=WARNING \
+          --exclude='opengrep-rules/**' \
+          --exclude='reports/**' \
+          --json \
+          1>${{ inputs.repository-name }}-opengrep.json
+      shell: bash
+
+    - name: Generate and Check Report
+      id: report
+      uses: ./.github/actions/ai-reports@main
+      with:
+        repository-name: ${{ inputs.repository-name }}
+        sast-recommend-uri: ${{ inputs.sast-recommend-uri }}
+        deepseek_api_key: ${{ inputs.deepseek_api_key }}
+
+    - name: Convert Markdown to TXT
+      id: convert
+      if: steps.report.outputs.has_findings == 'true'
+      uses: ./.github/actions/report-to-txt@main
+      with:
+        report_md: ${{ steps.report.outputs.report_md_file }}
+        output_txt: ${{ inputs.repository-name }}-sast-github-action.txt
+
+    - name: Extract High/Medium/Critical Findings
+      id: extract_findings
+      if: steps.report.outputs.has_findings == 'true'
+      shell: bash
+      run: |
+        report="${{ inputs.repository-name }}-sast-github-action.txt"
+        if [ ! -f "${report}" ]; then
+          echo "SAST report ${report} not found!"
+          echo "found=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Extract findings with HIGH, MEDIUM, or CRITICAL severity
+        if grep -qEi "HIGH|MEDIUM|CRITICAL" "${report}"; then
+          echo "found=true" >> $GITHUB_OUTPUT
+          echo "High/Medium/Critical findings detected in SAST scan"
+        else
+          echo "found=false" >> $GITHUB_OUTPUT
+          echo "No High/Medium/Critical findings detected"
+        fi
+
+    - name: Share OpenGrep Report to Slack
+      if: steps.report.outputs.has_findings == 'true'
+      uses: ./.github/actions/slack-feedbacks@main
+      with:
+        txt_file: ${{ steps.convert.outputs.txt_file }}
+        report_name: ${{ inputs.repository-name }}
+        slack_token: ${{ inputs.slack_token }}
+        slack_channel: ${{ inputs.slack_channel }}
+        report_type: sast
+
+    - name: Fail on High/Medium/Critical Findings
+      id: fail_on_findings
+      if: steps.extract_findings.outputs.found == 'true'
+      shell: bash
+      run: |
+        report="${{ inputs.repository-name }}-sast-github-action.txt"
+        echo "::error::SAST scan found HIGH, MEDIUM, or CRITICAL severity findings"
+        echo "::error::Please review the report: ${report}"
+
+        # Display the findings
+        echo "Findings summary:"
+        grep -Ei "HIGH|MEDIUM|CRITICAL" "${report}" || true
+
+        exit 1
